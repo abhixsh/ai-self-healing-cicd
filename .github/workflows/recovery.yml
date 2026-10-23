@@ -26,16 +26,18 @@ permissions:
   contents: read
 
 jobs:
-
   # --------------------------------------------------
-  # JOB 1: Human escalation
-  # This job does not modify the application.
+  # JOB 1: HUMAN ESCALATION
+  # Approval is required before sending the notification.
   # --------------------------------------------------
 
   escalate:
-    name: Escalate for Human Investigation
+    name: Escalate After Human Approval
     if: inputs.action == 'escalate_to_human'
     runs-on: ubuntu-latest
+
+    environment:
+      name: recovery-approval
 
     steps:
       - name: Checkout failed commit
@@ -62,15 +64,14 @@ jobs:
         run: |
           python ai-agent/agent.py notify \
             --subject "[RECOVERY ESCALATED] Human investigation required" \
-            --body "The CI pipeline failed and no safe automatic recovery was selected.
+            --body "Human approval was received for this escalation.
           Action: escalate_to_human
-          Original failed run: $FAILED_RUN_URL
-          Recovery run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-          No recovery action was executed. Human investigation is required."
+          Original failed CI run: $FAILED_RUN_URL
+          Recovery workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          No automatic recovery action was executed. Human investigation is required."
 
   # --------------------------------------------------
-  # JOB 2: Actual recovery
-  # This job REQUIRES human approval.
+  # JOB 2: AUTOMATIC RECOVERY AFTER HUMAN APPROVAL
   # --------------------------------------------------
 
   recover:
@@ -78,8 +79,6 @@ jobs:
     if: inputs.action != 'escalate_to_human'
     runs-on: ubuntu-latest
 
-    # Configure required reviewers for this environment
-    # in GitHub repository Settings -> Environments.
     environment:
       name: recovery-approval
 
@@ -97,15 +96,6 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
-
-      - name: Show recovery request
-        env:
-          ACTION: ${{ inputs.action }}
-          FAILED_RUN_URL: ${{ inputs.failed_run_url }}
-        run: |
-          echo "Human approval has been granted."
-          echo "Recovery action: $ACTION"
-          echo "Original failed run: $FAILED_RUN_URL"
 
       - name: Apply allowlisted recovery action
         id: recovery_action
@@ -137,12 +127,10 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-
           ACTION: ${{ inputs.action }}
           FAILED_RUN_URL: ${{ inputs.failed_run_url }}
           RECOVERY_OUTCOME: ${{ steps.recovery_action.outcome }}
           RETEST_OUTCOME: ${{ steps.retest.outcome }}
-        shell: bash
         run: |
           if [ "$RECOVERY_OUTCOME" = "success" ] && \
              [ "$RETEST_OUTCOME" = "success" ]; then
@@ -150,7 +138,7 @@ jobs:
             MESSAGE="Recovery completed and tests passed."
           else
             RESULT="FAILED"
-            MESSAGE="Recovery or test validation failed. Human investigation is required."
+            MESSAGE="Recovery or validation failed. Human investigation is required."
           fi
 
           python ai-agent/agent.py notify \
@@ -164,6 +152,4 @@ jobs:
 
       - name: Fail if recovery or validation failed
         if: always() && (steps.recovery_action.outcome != 'success' || steps.retest.outcome != 'success')
-        run: |
-          echo "Recovery or validation failed."
-          exit 1
+        run: exit 1

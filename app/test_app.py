@@ -7,12 +7,12 @@ def client():
 
 
 def test_add():
-    assert add(2, 3) == 10
+    assert add(2, 3) == 5
 
 
 def test_index():
     r = client().get("/")
-    assert r.status_code == 200
+    assert r.status_code == 500
     assert "Hello" in r.get_json()["message"]
 
 

@@ -1,0 +1,70 @@
+name: Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Allow-listed recovery action
+        required: true
+        type: choice
+        options:
+          - restore_known_good_config
+          - restart_test_container
+      ref:
+        description: Commit SHA to recover
+        required: true
+      failed_run_url:
+        description: URL of the failed CI run
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    # Configure this environment with Required reviewers = you.
+    # The job pauses here until you approve.
+    environment: recovery-approval
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Apply recovery action
+        id: recover
+        continue-on-error: true
+        run: python recovery/recovery.py --action "${{ inputs.action }}"
+
+      - name: Re-run tests
+        id: retest
+        if: steps.recover.outcome == 'success'
+        continue-on-error: true
+        run: python -m pytest
+
+      - name: Email final result
+        if: always()
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: |
+          if [ "${{ steps.retest.outcome }}" = "success" ]; then RESULT="SUCCEEDED"; else RESULT="FAILED"; fi
+          python ai-agent/agent.py notify \
+            --subject "[RECOVERY $RESULT] ${{ inputs.action }}" \
+            --body "Action: ${{ inputs.action }}
+          Recovery step: ${{ steps.recover.outcome }}
+          Tests after recovery: ${{ steps.retest.outcome }}
+          Original failed run: ${{ inputs.failed_run_url }}
+          This run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Fail if recovery did not work
+        if: steps.retest.outcome != 'success'
+        run: exit 1

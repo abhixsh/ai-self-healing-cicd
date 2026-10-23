@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write   # lets the failure step dispatch recovery.yml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: python -m pytest 2>&1 | tee test.log; exit ${PIPESTATUS[0]}
+        shell: bash
+
+      - name: AI analysis and email alert
+        if: steps.tests.outcome == 'failure'
+        env:
+          FOUNDRY_ENDPOINT: ${{ secrets.FOUNDRY_ENDPOINT }}
+          FOUNDRY_API_KEY: ${{ secrets.FOUNDRY_API_KEY }}
+          FOUNDRY_DEPLOYMENT: ${{ secrets.FOUNDRY_DEPLOYMENT }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTIONS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/recovery.yml
+        run: python ai-agent/agent.py analyse --log test.log --output proposal.json
+
+      - name: Request recovery (needs human approval)
+        if: steps.tests.outcome == 'failure' && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ACTION=$(python -c "import json;print(json.load(open('proposal.json'))['action'])")
+          if [ "$ACTION" = "escalate_to_human" ]; then
+            echo "No safe automatic action. Human investigation required."
+          else
+            gh workflow run recovery.yml \
+              -f action="$ACTION" \
+              -f ref="${{ github.sha }}" \
+              -f failed_run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+
+      - name: Fail the job if tests failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1

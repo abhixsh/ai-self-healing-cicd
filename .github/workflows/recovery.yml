@@ -4,15 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: Allow-listed recovery action
+        description: Recovery action or human escalation
         required: true
         type: choice
         options:
           - restore_known_good_config
           - restart_test_container
+          - escalate_to_human
+
       ref:
-        description: Commit SHA to recover
+        description: Commit SHA to investigate or recover
         required: true
+
       failed_run_url:
         description: URL of the failed CI run
         required: false
@@ -23,27 +26,60 @@ permissions:
 jobs:
   recover:
     runs-on: ubuntu-latest
-    # Configure this environment with Required reviewers = you.
-    # The job pauses here until you approve.
-    environment: recovery-approval
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Handle human escalation
+        if: inputs.action == 'escalate_to_human'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: |
+          python -m pip install -r requirements.txt
+
+          python -c "import os; print('Escalation requested for:', os.environ.get('GITHUB_REPOSITORY'))"
+
+          python -c "import os; print('Failed run:', os.environ.get('FAILED_RUN_URL', 'not supplied'))"
+        env:
+          FAILED_RUN_URL: ${{ inputs.failed_run_url }}
+
+      - name: Checkout failed commit
+        if: inputs.action != 'escalate_to_human'
+        uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        if: inputs.action != 'escalate_to_human'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt
 
-      - name: Apply recovery action
+      - name: Install dependencies
+        if: inputs.action != 'escalate_to_human'
+        run: pip install -r requirements.txt
+
+      - name: Apply approved recovery action
         id: recover
+        if: inputs.action != 'escalate_to_human'
         continue-on-error: true
-        run: python recovery/recovery.py --action "${{ inputs.action }}"
+        run: |
+          case "${{ inputs.action }}" in
+            restore_known_good_config|restart_test_container)
+              python recovery/recovery.py --action "${{ inputs.action }}"
+              ;;
+            *)
+              echo "Unsupported recovery action"
+              exit 1
+              ;;
+          esac
 
       - name: Re-run tests
         id: retest
-        if: steps.recover.outcome == 'success'
+        if: inputs.action != 'escalate_to_human' && steps.recover.outcome == 'success'
         continue-on-error: true
         run: python -m pytest
 
@@ -55,16 +91,33 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ACTION: ${{ inputs.action }}
+          FAILED_RUN_URL: ${{ inputs.failed_run_url }}
+          RECOVERY_OUTCOME: ${{ steps.recover.outcome }}
+          RETEST_OUTCOME: ${{ steps.retest.outcome }}
         run: |
-          if [ "${{ steps.retest.outcome }}" = "success" ]; then RESULT="SUCCEEDED"; else RESULT="FAILED"; fi
-          python ai-agent/agent.py notify \
-            --subject "[RECOVERY $RESULT] ${{ inputs.action }}" \
-            --body "Action: ${{ inputs.action }}
-          Recovery step: ${{ steps.recover.outcome }}
-          Tests after recovery: ${{ steps.retest.outcome }}
-          Original failed run: ${{ inputs.failed_run_url }}
-          This run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python -m pip install -r requirements.txt
 
-      - name: Fail if recovery did not work
-        if: steps.retest.outcome != 'success'
+          if [ "$ACTION" = "escalate_to_human" ]; then
+            RESULT="ESCALATED"
+            BODY="No safe automatic recovery was selected. Human investigation is required."
+          elif [ "$RETEST_OUTCOME" = "success" ]; then
+            RESULT="SUCCEEDED"
+            BODY="Recovery and validation completed successfully."
+          else
+            RESULT="FAILED"
+            BODY="Recovery or validation failed. Human investigation is required."
+          fi
+
+          python ai-agent/agent.py notify \
+            --subject "[RECOVERY $RESULT] $ACTION" \
+            --body "Action: $ACTION
+          Recovery step: ${RECOVERY_OUTCOME:-not run}
+          Tests after recovery: ${RETEST_OUTCOME:-not run}
+          Original failed run: $FAILED_RUN_URL
+          This run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Result: $BODY"
+
+      - name: Fail if recovery or validation failed
+        if: inputs.action != 'escalate_to_human' && (steps.recover.outcome != 'success' || steps.retest.outcome != 'success')
         run: exit 1

@@ -7,27 +7,35 @@ on:
 
 permissions:
   contents: read
-  actions: write   # lets the failure step dispatch recovery.yml
+  actions: write
 
 jobs:
   test:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Run tests
         id: tests
         continue-on-error: true
-        run: python -m pytest 2>&1 | tee test.log; exit ${PIPESTATUS[0]}
         shell: bash
+        run: |
+          python -m pytest 2>&1 | tee test.log
+          exit "${PIPESTATUS[0]}"
 
       - name: AI analysis and email alert
+        id: analysis
         if: steps.tests.outcome == 'failure'
+        continue-on-error: true
         env:
           FOUNDRY_ENDPOINT: ${{ secrets.FOUNDRY_ENDPOINT }}
           FOUNDRY_API_KEY: ${{ secrets.FOUNDRY_API_KEY }}
@@ -39,23 +47,47 @@ jobs:
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ACTIONS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/recovery.yml
-        run: python ai-agent/agent.py analyse --log test.log --output proposal.json
+        run: |
+          python ai-agent/agent.py analyse --log test.log --output proposal.json
 
-      - name: Request recovery (needs human approval)
+      - name: Validate recovery decision
+        id: decision
+        if: steps.tests.outcome == 'failure' && github.event_name == 'push'
+        env:
+          ANALYSIS_OUTCOME: ${{ steps.analysis.outcome }}
+        run: |
+          ACTION="escalate_to_human"
+
+          if [ "$ANALYSIS_OUTCOME" = "success" ] && [ -f proposal.json ]; then
+            CANDIDATE=$(python -c "import json; print(json.load(open('proposal.json')).get('action', 'escalate_to_human'))") || CANDIDATE="escalate_to_human"
+
+            case "$CANDIDATE" in
+              restore_known_good_config|restart_test_container)
+                ACTION="$CANDIDATE"
+                ;;
+              *)
+                ACTION="escalate_to_human"
+                ;;
+            esac
+          fi
+
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "Recovery decision: $ACTION"
+
+      - name: Automatically trigger Recovery workflow
         if: steps.tests.outcome == 'failure' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.decision.outputs.action }}
+          FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          ACTION=$(python -c "import json;print(json.load(open('proposal.json'))['action'])")
-          if [ "$ACTION" = "escalate_to_human" ]; then
-            echo "No safe automatic action. Human investigation required."
-          else
-            gh workflow run recovery.yml \
-              -f action="$ACTION" \
-              -f ref="${{ github.sha }}" \
-              -f failed_run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          fi
+          gh workflow run recovery.yml \
+            --ref master \
+            -f action="$ACTION" \
+            -f ref="$COMMIT_SHA" \
+            -f failed_run_url="$FAILED_RUN_URL"
 
-      - name: Fail the job if tests failed
+      - name: Fail CI if tests failed
         if: steps.tests.outcome == 'failure'
         run: exit 1

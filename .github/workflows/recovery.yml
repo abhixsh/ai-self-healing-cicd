@@ -15,56 +15,27 @@ on:
       ref:
         description: Commit SHA to investigate or recover
         required: true
+        type: string
 
       failed_run_url:
-        description: URL of the failed CI run
+        description: URL of the original failed CI run
         required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+
+  # --------------------------------------------------
+  # JOB 1: Human escalation
+  # This job does not modify the application.
+  # --------------------------------------------------
+
   escalate:
+    name: Escalate for Human Investigation
     if: inputs.action == 'escalate_to_human'
     runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout requested commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Email escalation report
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-          FAILED_RUN_URL: ${{ inputs.failed_run_url }}
-        run: |
-          python ai-agent/agent.py notify \
-            --subject "[RECOVERY ESCALATED] Human investigation required" \
-            --body "No safe automatic recovery was selected.
-          Action: escalate_to_human
-          Original failed run: $FAILED_RUN_URL
-          Recovery workflow: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-          No recovery action was executed. Human investigation is required."
-
-  recover:
-    if: inputs.action != 'escalate_to_human'
-    runs-on: ubuntu-latest
-
-    # Configure required reviewers in GitHub Settings > Environments.
-    environment: recovery-approval
 
     steps:
       - name: Checkout failed commit
@@ -78,10 +49,66 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
-      - name: Apply recovery action
-        id: recover
+      - name: Send escalation email
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          FAILED_RUN_URL: ${{ inputs.failed_run_url }}
+        run: |
+          python ai-agent/agent.py notify \
+            --subject "[RECOVERY ESCALATED] Human investigation required" \
+            --body "The CI pipeline failed and no safe automatic recovery was selected.
+          Action: escalate_to_human
+          Original failed run: $FAILED_RUN_URL
+          Recovery run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          No recovery action was executed. Human investigation is required."
+
+  # --------------------------------------------------
+  # JOB 2: Actual recovery
+  # This job REQUIRES human approval.
+  # --------------------------------------------------
+
+  recover:
+    name: Recover After Human Approval
+    if: inputs.action != 'escalate_to_human'
+    runs-on: ubuntu-latest
+
+    # Configure required reviewers for this environment
+    # in GitHub repository Settings -> Environments.
+    environment:
+      name: recovery-approval
+
+    steps:
+      - name: Checkout failed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Show recovery request
+        env:
+          ACTION: ${{ inputs.action }}
+          FAILED_RUN_URL: ${{ inputs.failed_run_url }}
+        run: |
+          echo "Human approval has been granted."
+          echo "Recovery action: $ACTION"
+          echo "Original failed run: $FAILED_RUN_URL"
+
+      - name: Apply allowlisted recovery action
+        id: recovery_action
         continue-on-error: true
         env:
           ACTION: ${{ inputs.action }}
@@ -91,18 +118,18 @@ jobs:
               python recovery/recovery.py --action "$ACTION"
               ;;
             *)
-              echo "Unsupported recovery action"
+              echo "Unsupported recovery action: $ACTION"
               exit 1
               ;;
           esac
 
-      - name: Re-run tests
+      - name: Re-run Python tests
         id: retest
-        if: steps.recover.outcome == 'success'
+        if: steps.recovery_action.outcome == 'success'
         continue-on-error: true
         run: python -m pytest
 
-      - name: Email final result
+      - name: Send recovery result email
         if: always()
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -110,25 +137,33 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+
           ACTION: ${{ inputs.action }}
           FAILED_RUN_URL: ${{ inputs.failed_run_url }}
-          RECOVERY_OUTCOME: ${{ steps.recover.outcome }}
+          RECOVERY_OUTCOME: ${{ steps.recovery_action.outcome }}
           RETEST_OUTCOME: ${{ steps.retest.outcome }}
+        shell: bash
         run: |
-          if [ "$RECOVERY_OUTCOME" = "success" ] && [ "$RETEST_OUTCOME" = "success" ]; then
+          if [ "$RECOVERY_OUTCOME" = "success" ] && \
+             [ "$RETEST_OUTCOME" = "success" ]; then
             RESULT="SUCCEEDED"
+            MESSAGE="Recovery completed and tests passed."
           else
             RESULT="FAILED"
+            MESSAGE="Recovery or test validation failed. Human investigation is required."
           fi
 
           python ai-agent/agent.py notify \
             --subject "[RECOVERY $RESULT] $ACTION" \
-            --body "Action: $ACTION
+            --body "Recovery action: $ACTION
           Recovery step: ${RECOVERY_OUTCOME:-not run}
           Tests after recovery: ${RETEST_OUTCOME:-not run}
-          Original failed run: $FAILED_RUN_URL
-          Recovery run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          Original failed CI run: $FAILED_RUN_URL
+          Recovery workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Result: $MESSAGE"
 
       - name: Fail if recovery or validation failed
-        if: steps.recover.outcome != 'success' || steps.retest.outcome != 'success'
-        run: exit 1
+        if: always() && (steps.recovery_action.outcome != 'success' || steps.retest.outcome != 'success')
+        run: |
+          echo "Recovery or validation failed."
+          exit 1

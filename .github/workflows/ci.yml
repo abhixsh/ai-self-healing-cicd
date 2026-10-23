@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
   pull_request:
 
 permissions:
@@ -11,28 +12,31 @@ permissions:
 
 jobs:
   test:
+    name: Test, Analyse and Trigger Recovery
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
-      - name: Run tests
+      - name: Run Python tests
         id: tests
         continue-on-error: true
         shell: bash
         run: |
+          set -o pipefail
           python -m pytest 2>&1 | tee test.log
-          exit "${PIPESTATUS[0]}"
 
-      - name: AI analysis and email alert
+      - name: Analyse failure with Azure AI Foundry
         id: analysis
         if: steps.tests.outcome == 'failure'
         continue-on-error: true
@@ -40,26 +44,35 @@ jobs:
           FOUNDRY_ENDPOINT: ${{ secrets.FOUNDRY_ENDPOINT }}
           FOUNDRY_API_KEY: ${{ secrets.FOUNDRY_API_KEY }}
           FOUNDRY_DEPLOYMENT: ${{ secrets.FOUNDRY_DEPLOYMENT }}
+
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ACTIONS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/recovery.yml
         run: |
-          python ai-agent/agent.py analyse --log test.log --output proposal.json
+          python ai-agent/agent.py analyse \
+            --log test.log \
+            --output proposal.json
 
-      - name: Validate recovery decision
+      - name: Select safe recovery action
         id: decision
         if: steps.tests.outcome == 'failure' && github.event_name == 'push'
         env:
           ANALYSIS_OUTCOME: ${{ steps.analysis.outcome }}
+        shell: bash
         run: |
           ACTION="escalate_to_human"
 
           if [ "$ANALYSIS_OUTCOME" = "success" ] && [ -f proposal.json ]; then
-            CANDIDATE=$(python -c "import json; print(json.load(open('proposal.json')).get('action', 'escalate_to_human'))") || CANDIDATE="escalate_to_human"
+            CANDIDATE=$(python -c "
+          import json
+          with open('proposal.json', encoding='utf-8') as f:
+              print(json.load(f).get('action', 'escalate_to_human'))
+          ") || CANDIDATE="escalate_to_human"
 
             case "$CANDIDATE" in
               restore_known_good_config|restart_test_container)
@@ -72,15 +85,15 @@ jobs:
           fi
 
           echo "action=$ACTION" >> "$GITHUB_OUTPUT"
-          echo "Recovery decision: $ACTION"
+          echo "Selected action: $ACTION"
 
       - name: Automatically trigger Recovery workflow
         if: steps.tests.outcome == 'failure' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTION: ${{ steps.decision.outputs.action }}
-          FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
+          FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh workflow run recovery.yml \
             --ref master \
@@ -88,6 +101,9 @@ jobs:
             -f ref="$COMMIT_SHA" \
             -f failed_run_url="$FAILED_RUN_URL"
 
-      - name: Fail CI if tests failed
+      - name: Fail CI when tests fail
         if: steps.tests.outcome == 'failure'
-        run: exit 1
+        run: |
+          echo "Python tests failed."
+          echo "Check the Recovery workflow for the next steps."
+          exit 1
